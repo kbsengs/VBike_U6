@@ -1,0 +1,73 @@
+# Unity 생성 폴더
+/Library/
+/Temp/
+/Logs/
+/obj/
+/Build/
+/Builds/
+/UserSettings/
+
+# Unity 캐시
+*.pidb
+*.unityproj
+*.suo
+*.user
+*.userprefs
+*.booproj
+*.svd
+*.pdb
+*.opendb
+*.VC.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Visual Studio
+.vs/
+*.csproj
+*.sln
+
+# 대용량 바이너리 에셋 (14GB — GitHub 제한 초과)
+*.fbx
+*.FBX
+*.obj
+*.OBJ
+*.png
+*.jpg
+*.jpeg
+*.tga
+*.psd
+*.exr
+*.hdr
+*.tif
+*.tiff
+*.bmp
+*.gif
+*.mp3
+*.wav
+*.ogg
+*.mp4
+*.avi
+*.mov
+*.dll
+*.zip
+*.asset
+*.mat
+*.anim
+*.controller
+*.mask
+*.overrideController
+*.brush
+*.flare
+*.guiskin
+*.physicMaterial
+*.physicsMaterial2D
+*.renderTexture
+*.cubemap
+*.spriteatlas
+*.giparams
+
+# 라이트맵
+/Assets/Bike Assets/Program/Park/Scene/Map*/
+/Assets/Bike Assets/Program/Park/Scene/*Settings.lighting
