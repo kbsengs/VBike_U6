@@ -1,653 +1,508 @@
 using UnityEngine;
 using System.Collections;
-using System.Collections.Generic;
 
-public class Cycle_Move : MoveModule {
-
+// ══════════════════════════════════════════════════════════════════
+// Cycle_Move — Raycast 기반 자전거 이동 (WheelCollider 제거)
+//
+// 변경 이유:
+//   Unity 6 PhysX 5.x 에서 WheelCollider + MeshCollider(대삼각형) 조합이
+//   수백 m/s 폭발력을 발생시켜 스폰 직후 즉시 Crash되는 문제 확인.
+//   WheelCollider를 완전히 제거하고 Raycast 2개(앞/뒷바퀴)로 대체.
+//
+// 이동 원리:
+//   1. 시작 후 START_DELAY(1초) kinematic 유지 → 지면 스냅
+//   2. kinematic 해제 → Raycast 접지 감지
+//   3. 전진/후진: _rb.linearVelocity 직접 설정 (forward * targetSpeed)
+//   4. 조향: transform.Rotate (Y축)
+//   5. 기울기 안정화: Z축 eulerAngles 보정
+// ══════════════════════════════════════════════════════════════════
+public class Cycle_Move : MoveModule
+{
     private Cycle_Control _control;
-    private float fDelayTime = 0.0f;
 
-    // ══════════════════════════════════════════════════════════
-    // 물리 단계 (physicsPhase)
-    //   0 = 스폰 직후 대기 (3초, kinematic, 키 입력 차단)
-    //   1 = 물리 안정화   (최대 2초, 접지 대기, 키 입력 차단)
-    //   2 = 정상 주행     (플레이어 입력 유효)
-    // ══════════════════════════════════════════════════════════
-    private int physicsPhase = 0;
-    private float groundedTimer = 0f;
-    private const float SETTLE_TIMEOUT = 2.0f;  // Phase 1 최대 대기 시간(초)
-    private float phase2StabTimer = 0f;           // Phase 2 진입 직후 안정화 시간
-    private const float PHASE2_STAB_TIME = 0.5f; // Phase 2 초기 angularVelocity 억제 시간(초)
-
-    // ══════════════════════════════════════════════════════════
-    // 속도 단계 변수 (_pedalLevel)
-    //   - 위 화살표(↑) 한 번 = +1단계, 아래 화살표(↓) 한 번 = -1단계
-    //   - 범위: -10(후진 최대) ~ 0(정지) ~ +10(전진 최대)
-    //   - 실제 속도: pedalSpeed = _pedalLevel × PEDAL_STEP
-    //   - 1단계 = PEDAL_STEP(13) ≈ 10 km/h
-    //   - 최대(10단계) = 130 ≈ 100 km/h
-    // ══════════════════════════════════════════════════════════
-    [HideInInspector] public int _pedalLevel = 0;   // 외부(BikeDebugOverlay)에서 읽기용
+    [HideInInspector] public int _pedalLevel      = 0;  // 디버그 오버레이용
     [HideInInspector] public int physicsPhasePublic = 0; // 디버그 오버레이용
-    private const int   PEDAL_MAX  = 20;             // 테스트 최대 단계 = 20 km/h
-    private const float PEDAL_STEP = 13f;            // 내부 단위 (사용 안 함, 호환 유지)
 
-    private int _prevDeadState = 0; // Respawn 감지용
-    // Phase 2 진입 후 플레이어가 Up 키를 누를 때까지 kinematic 유지
-    // (스폰 지점 폴리곤 메시 대삼각형 PhysX 불안정 완전 차단)
-    private bool _waitingForPedal = true;
-    // 충돌 무시한 MeshCollider 목록 (복구 시 동일 목록 사용)
-    private System.Collections.Generic.List<Collider> _ignoredMeshColliders
-        = new System.Collections.Generic.List<Collider>();
+    private const int   PEDAL_MAX    = 20;    // 최대 단계 (±20)
+    private const float KMH_PER_STEP = 10f;   // 단계당 속도 (km/h)
+    private const float START_DELAY  = 1.0f;  // 스폰 후 kinematic 대기 시간(초)
 
-	void Start () {
+    private float _startTimer    = 0f;
+    private bool  _ready         = false;
+    private int   _prevDeadState = 0;
+
+    // 점프 감지
+    private float _jumpTime  = 0f;
+    private bool  _bLanding  = false;
+
+    // 수직 이동 (수동 중력)
+    private float   _verticalVel  = 0f;
+    private float   _groundY      = 0f;
+    private float _groundOffset = 0.33f; // WheelCollider 기반 자동 계산 (Start에서 갱신)
+    private Vector3 _prevPos;
+    private RaycastHit _fHit, _rHit;
+
+    // 하드웨어 Serial 내부 상태
+    private int   _breakold   = 0;
+    private bool  _handleAct  = false;
+    private float _jTime      = 0f;
+
+    // ── Start ─────────────────────────────────────────────────────
+    void Start()
+    {
         _control = GetComponent<Cycle_Control>();
-        Init(_control.moveValue.centerOfMass, _control.moveValue.frontTire, _control.moveValue.rearTire);
-        FrictionValue_F(forwardFriction, _control.moveValue.forwardFriction.extremumSlip, _control.moveValue.forwardFriction.extremumValue
-            , _control.moveValue.forwardFriction.asymptoteSlip, _control.moveValue.forwardFriction.asymptoteValue, _control.moveValue.forwardFriction.stiffness);
-        FrictionValue_S(sideFriction, _control.moveValue.sideFriction.extremumSlip, _control.moveValue.sideFriction.extremumValue
-           , _control.moveValue.sideFriction.asymptoteSlip, _control.moveValue.sideFriction.asymptoteValue, _control.moveValue.sideFriction.stiffness);
-        SpringSet(suspension, _control.moveValue.suspension.spring, _control.moveValue.suspension.damper, _control.moveValue.suspension.position);
-        FrictionSetting();
+        Init(_control.moveValue.centerOfMass,
+             _control.moveValue.frontTire,
+             _control.moveValue.rearTire);
 
-        // ── 시작 시 속도 초기화 ──────────────────────────────
-        fDelayTime  = 0.0f;
-        physicsPhase = 0;
-        _pedalLevel  = 0;       // ← 속도 단계 0
-        pedalSpeed   = 0f;      // ← 물리 속도 0
-        // ─────────────────────────────────────────────────────
+        // WheelCollider 완전 비활성 — Raycast 이동으로 교체
+        if (wheelSetting.wheels != null)
+            foreach (WheelCollider wc in wheelSetting.wheels)
+                if (wc != null) wc.enabled = false;
 
-        // Phase 0/1 동안 충돌 감지 비활성
-        // (스폰 직후 Up Crash 등 crash detection이 즉시 발동하는 버그 방지)
-        // Phase 2 안정화 완료 시점에 다시 true로 복구
+        // _groundOffset 자동 계산: 뒷바퀴 WheelCollider 위치·반경 기반
+        // 공식: pivot.y - groundY = WheelCollider.radius - (wcWorldY - pivot.y)
+        //      → 바퀴 바닥(wcWorldY - radius)이 지면에 닿을 때 pivot이 지면에서 떨어진 높이
+        if (wheelSetting.rear != null)
+        {
+            WheelCollider rearWC = wheelSetting.rear;
+            Vector3 wcWorld = rearWC.transform.TransformPoint(rearWC.center);
+            float pivotToWheelCenterY = wcWorld.y - transform.position.y;
+            _groundOffset = rearWC.radius - pivotToWheelCenterY;
+            Debug.Log(string.Format("[Cycle_Move] _groundOffset 자동계산: radius={0:F3} wcWorldY={1:F3} pivotY={2:F3} pivotToWheelCenterY={3:F3} → _groundOffset={4:F3}",
+                rearWC.radius, wcWorld.y, transform.position.y, pivotToWheelCenterY, _groundOffset));
+        }
+        else
+        {
+            Debug.LogWarning("[Cycle_Move] wheelSetting.rear==null — _groundOffset 기본값 0.33f 사용");
+        }
+
+        // Rigidbody 완전 kinematic — 차체 Collider와 MeshCollider 충돌 폭발력 원천 차단
+        // 이동·중력·지면 스냅을 코드가 직접 제어
+        _rb.isKinematic = true;
+        _rb.useGravity   = false;
+
         _control.cycle_Impact = false;
+        _pedalLevel = 0;
+        pedalSpeed  = 0f;
+        handle      = 0f;
+        steer       = 0f;
 
-        _rb.maxDepenetrationVelocity = 1.0f; // PhysX 관통 폭발력 제한
+        Debug.Log("[Cycle_Move] Start — Kinematic Raycast 이동 모드 TEST_MODE=" + GameData.TEST_MODE);
+    }
 
-        Debug.Log("[Cycle_Move] Start() TEST_MODE=" + GameData.TEST_MODE
-                  + " pedalLevel=" + _pedalLevel + " pedalSpeed=" + pedalSpeed);
-	}
-
-    // ══════════════════════════════════════════════════════════
-    // 키 입력: Phase 2 에서만 허용
-    //   Phase 0·1 에서 허용하면 대기 중 _pedalLevel 이 최대치가 되어
-    //   Phase 2 진입 즉시 최고속도로 출발하는 버그 발생
-    // ══════════════════════════════════════════════════════════
+    // ── Update: 키 입력 (준비 완료 후만) ─────────────────────────
     void Update()
     {
-        if (!GameData.TEST_MODE || physicsPhase < 2) return; // Phase 0·1 차단
+        if (!GameData.TEST_MODE || !_ready) return;
 
-        if (Input.GetKeyDown(KeyCode.UpArrow) || Input.GetKeyDown(KeyCode.W))
-            _pedalLevel = System.Math.Min(_pedalLevel + 1, PEDAL_MAX);
+        if      (Input.GetKeyDown(KeyCode.UpArrow)   || Input.GetKeyDown(KeyCode.W))
+            _pedalLevel = Mathf.Min(_pedalLevel + 1,  PEDAL_MAX);
         else if (Input.GetKeyDown(KeyCode.DownArrow) || Input.GetKeyDown(KeyCode.S))
-            _pedalLevel = System.Math.Max(_pedalLevel - 1, -PEDAL_MAX);
+            _pedalLevel = Mathf.Max(_pedalLevel - 1, -PEDAL_MAX);
     }
 
-    // ══════════════════════════════════════════════════════════
-    // ApplyKeyboard: Phase 2 에서 매 프레임 호출 (TEST_MODE=true 전용)
-    //   _pedalLevel → pedalSpeed 변환 + 핸들 처리
-    // ══════════════════════════════════════════════════════════
-    void ApplyKeyboard()
+    // ── FixedUpdate ───────────────────────────────────────────────
+    void FixedUpdate()
     {
-        pedalSpeed = _pedalLevel * PEDAL_STEP; // ← 여기서 속도 결정
-
-        if (Input.GetKey(KeyCode.RightArrow) || Input.GetKey(KeyCode.D))
-            handle = 1f;
-        else if (Input.GetKey(KeyCode.LeftArrow) || Input.GetKey(KeyCode.A))
-            handle = -1f;
-        else
-            handle = 0f;
-
-        steer = maxValue.MaxSteer * handle;
-
-        // _pedalLevel == 0 이면 정지·브레이크
-        if (_pedalLevel == 0)
-        {
-            pedalSpeed = 0f;
-            if (wheelSetting.wheels != null)
-                foreach (WheelCollider pos in wheelSetting.wheels)
-                    pos.brakeTorque = 500f;
-            return;
-        }
-
-        if ((groundR || groundF) && Input.GetKeyDown(KeyCode.Q))
-            _rb.AddForce(transform.up * 250, ForceMode.Acceleration);
-
-        drift = Input.GetKey(KeyCode.Space) || CBikeSerial.GetDrift();
-    }
-
-	void FixedUpdate () {
         SyncData_Receive();
+        if (!_control.cycle_Move) return;
 
-        if (!_control.cycle_Move)
-            return;
-
-        // ══════════════════════════════════════════════════════
-        // Respawn 감지: deadState 가 0 이 아닌 상태에서 0 으로 돌아오면
-        //              physicsPhase 를 0 으로 리셋해 Phase 0 부터 재시작
-        // ══════════════════════════════════════════════════════
+        // Respawn 감지
         if (_control.deadState == 0 && _prevDeadState != 0)
-        {
-            physicsPhase = 0;
-            fDelayTime   = 0f;
-            _pedalLevel  = 0;
-            pedalSpeed   = 0f;
-            groundedTimer = 0f;
-            phase2StabTimer = 0f;
-            _waitingForPedal = true;
-            _rb.isKinematic = true;
-            _control.cycle_Impact = false; // Respawn 후 Phase 0 재시작 시 충돌 감지 재비활성
-            Debug.Log("[Cycle_Move] Respawn → Phase 0 리셋");
-        }
+            DoRespawn();
         _prevDeadState = _control.deadState;
 
-        // ══════════════════════════════════════════════════════
-        // Phase 0: 스폰 직후 대기 (3 초, kinematic)
-        //   - SnapToGround 로 지면 위에 바이크 배치
-        //   - motorTorque·pedalSpeed = 0 으로 강제
-        //   - 3 초 후 isKinematic = false → Phase 1 이동
-        // ══════════════════════════════════════════════════════
-        if (physicsPhase == 0)
+        // Crash(1) / Respawn대기(2) 중 이동 완전 중단
+        // Cycle_Impact가 위치를 제어하는 동안 Cycle_Move가 바이크를 움직이지 않도록
+        if (_control.deadState != 0)
         {
-            fDelayTime += Time.deltaTime;
+            SyncData_Send_Self();
+            SyncData_Send();
+            return;
+        }
+
+        // ── 시작 대기 (START_DELAY 초 kinematic) ─────────────────
+        if (!_ready)
+        {
+            _startTimer += Time.fixedDeltaTime;
             _rb.isKinematic = true;
             SnapToGround();
-            // 웨이포인트 rotation의 z값(좌우 기울기)을 0으로 보정
-            // 경사면 waypoint에 스폰 시 Phase 1 진입 시 큰 lrAngle 방지
+
+            // z축 기울기 초기화
             Vector3 e0 = transform.eulerAngles;
-            if (Mathf.Abs(e0.z) > 0.5f && e0.z < 359.5f)
-                transform.eulerAngles = new Vector3(e0.x, e0.y, 0f);
-            if (wheelSetting.wheels != null)
-                foreach (WheelCollider pos in wheelSetting.wheels)
-                { pos.motorTorque = 0f; pos.brakeTorque = 500f; }
+            transform.eulerAngles = new Vector3(e0.x, e0.y, 0f);
 
-            if (fDelayTime >= 3.0f)
+            if (_startTimer >= START_DELAY)
             {
-                _rb.isKinematic = false;
-                _rb.linearVelocity  = Vector3.zero;
-                _rb.angularVelocity = Vector3.zero;
-                pedalSpeed  = 0f;
-                _pedalLevel = 0;
-                physicsPhase = 1;
-                physicsPhasePublic = 1;
-                groundedTimer = 0f;
-                Debug.Log("[Cycle_Move] Phase 0 → 1");
+                // kinematic 유지 — 물리 충돌 없이 코드로 직접 이동
+                _ready              = true;
+                physicsPhasePublic  = 2;
+                _control.cycle_Impact = true;
+                _prevPos = transform.position;
+                Debug.Log("[Cycle_Move] 준비 완료 — 주행 가능");
             }
-            return;
-        }
-
-        // ══════════════════════════════════════════════════════
-        // Phase 1: 안전 정착 대기 (최대 2 초, kinematic 유지)
-        //   - Phase 0 와 동일하게 kinematic + SnapToGround 유지
-        //   - 근본 원인: WheelCollider 스프링이 폴리곤 벽을 지면으로 오인하여
-        //     폭발적 힘을 생성 → kinematic 유지로 완전 차단
-        //   - 접지(groundF & groundR) 또는 타임아웃 확인 후
-        //     Phase 2 진입 직전에만 isKinematic = false
-        // ══════════════════════════════════════════════════════
-        if (physicsPhase == 1)
-        {
-            // kinematic 유지 + 매 프레임 SnapToGround (Phase 0 와 동일)
-            _rb.isKinematic = true;
-            SnapToGround();
-            // 좌우 기울기 수직화 (lrAngle 조건 통과 보장)
-            Vector3 e1 = transform.eulerAngles;
-            if (Mathf.Abs(e1.z) > 0.5f && e1.z < 359.5f)
-                transform.eulerAngles = new Vector3(e1.x, e1.y, 0f);
-
-            if (wheelSetting.wheels != null)
-                foreach (WheelCollider pos in wheelSetting.wheels)
-                { pos.motorTorque = 0f; pos.brakeTorque = 10000f; }
-
-            PhysicsValue(); // groundF, groundR, lrAngle 업데이트
-            groundedTimer += Time.fixedDeltaTime;
-
-            // 접지 또는 타임아웃 → Phase 2 진입
-            bool groundReady = groundF && groundR && groundedTimer >= 0.3f && Mathf.Abs(lrAngle) < 35f;
-            bool timeout     = groundedTimer >= SETTLE_TIMEOUT;
-            if (groundReady || timeout)
-            {
-                // Phase 2 진입 직전: 최종 위치·자세 확정 후 kinematic 해제
-                SnapToGround();
-                Vector3 e = transform.eulerAngles;
-                transform.eulerAngles = new Vector3(e.x, e.y, 0f);
-
-                _rb.isKinematic = false;   // 안전 위치에서만 물리 활성화
-                _rb.linearVelocity  = Vector3.zero;
-                _rb.angularVelocity = Vector3.zero;
-                steer       = 0f;
-                handle      = 0f;
-                _pedalLevel = 0;
-                pedalSpeed  = 0f;
-
-                phase2StabTimer = 0f;
-                _waitingForPedal = true;
-                physicsPhase = 2;
-                physicsPhasePublic = 2;
-                LogTerrainAtPhase2();
-                Debug.Log("[Cycle_Move] Phase 1 → 2 (kinematic 해제) lrAngle=" + lrAngle.ToString("F1")
-                          + " groundedTimer=" + groundedTimer.ToString("F2")
-                          + " reason=" + (groundReady ? "groundReady" : "timeout"));
-            }
-
             SyncData_Send_Self();
             SyncData_Send();
             return;
         }
 
-        // ══════════════════════════════════════════════════════
-        // Phase 2: 정상 주행
-        //   TEST_MODE = true  → ApplyKeyboard() : _pedalLevel × 13 = pedalSpeed
-        //   TEST_MODE = false → Serial()        : 하드웨어(CBikeSerial) 입력
-        //
-        //   _waitingForPedal = true (초기값):
-        //     kinematic 유지 + SnapToGround. 플레이어가 Up 키(↑)를 눌러
-        //     _pedalLevel > 0 이 될 때까지 폴리곤 스폰 지점 PhysX 불안정 완전 차단.
-        //
-        //   _waitingForPedal = false (플레이어 Up 입력 후):
-        //     kinematic 해제 → PHASE2_STAB_TIME(0.5초) 안정화 → cycle_Impact 활성
-        // ══════════════════════════════════════════════════════
+        // ── 주행 ─────────────────────────────────────────────────
+        UpdateAngles();
 
-        // ── 플레이어 Up 입력 대기 (kinematic 유지) ─────────
-        if (_waitingForPedal)
-        {
-            _rb.isKinematic = true;
-            SnapToGround();
-            Vector3 ep = transform.eulerAngles;
-            if (Mathf.Abs(ep.z) > 0.5f && ep.z < 359.5f)
-                transform.eulerAngles = new Vector3(ep.x, ep.y, 0f);
-            if (wheelSetting.wheels != null)
-                foreach (WheelCollider pos in wheelSetting.wheels)
-                { pos.motorTorque = 0f; pos.brakeTorque = 10000f; }
-            PhysicsValue();
-            SyncData_Send_Self();
-            SyncData_Send();
-
-            // TEST_MODE: Up 키 입력 시 kinematic 해제
-            if (GameData.TEST_MODE && _pedalLevel != 0)
-            {
-                SnapToGround(); // 최종 위치 확정
-                Vector3 ef = transform.eulerAngles;
-                transform.eulerAngles = new Vector3(ef.x, ef.y, 0f);
-
-                // WheelCollider 일시 비활성 — 폴리곤 경계 PhysX 불안정 접촉 차단
-                if (wheelSetting.wheels != null)
-                    foreach (WheelCollider wc in wheelSetting.wheels)
-                        wc.enabled = false;
-
-                // 반경 5m 내 모든 MeshCollider 충돌 일시 무시 — 폴리곤/지형 접촉력 원천 차단
-                IgnoreNearbyMeshColliders(true);
-
-                _rb.isKinematic = false;
-                _rb.linearVelocity  = Vector3.zero;
-                _rb.angularVelocity = Vector3.zero;
-                phase2StabTimer = 0f;
-                _waitingForPedal = false;
-                Debug.Log("[Cycle_Move] 페달 입력 → kinematic 해제 (pedalLevel=" + _pedalLevel + ")");
-
-                // 3초 후 WheelCollider + Polygon 충돌 복구
-                StartCoroutine(ReenableWheelColliders(3.0f));
-            }
-            return;
-        }
-
-        phase2StabTimer += Time.fixedDeltaTime;
-        if (phase2StabTimer < PHASE2_STAB_TIME)
-        {
-            if (!_rb.isKinematic)
-            {
-                _rb.angularVelocity = Vector3.zero;
-                Vector3 vStab = _rb.linearVelocity; vStab.x = 0f; vStab.z = 0f;
-                _rb.linearVelocity = vStab;
-            }
-            if (wheelSetting.wheels != null)
-                foreach (WheelCollider pos in wheelSetting.wheels)
-                { pos.motorTorque = 0f; pos.brakeTorque = 10000f; }
-            PhysicsValue();
-            SyncData_Send_Self();
-            SyncData_Send();
-            return;
-        }
-
-        // Phase 2 안정화 완료 → 충돌 감지 활성 (Phase 0 Start()에서 비활성화했던 것 복구)
-        if (!_control.cycle_Impact)
-        {
-            _control.cycle_Impact = true;
-            Debug.Log("[Cycle_Move] Phase 2 stab 완료 → cycle_Impact 활성");
-        }
-
-        if (GameData.TEST_MODE)
-            ApplyKeyboard();
-        else
-            Serial();
+        if (GameData.TEST_MODE) ApplyKeyboard();
+        else                    Serial();
 
         CheckJump();
-        PhysicsValue();
+        RaycastGround();
+        ApplyMovement();
+        StabilizeLean();
+        UpdateSpeed();
 
         if (_control.gameFinish)
         {
-            pedalSpeed  = 0;
+            pedalSpeed  = 0f;
             _pedalLevel = 0;
             _control.cycle_Move = false;
             _control.cycle_AI   = true;
         }
 
-        if (GameData.TEST_MODE)
+        SyncData_Send_Self();
+        SyncData_Send();
+    }
+
+    // ── 각도 계산 ─────────────────────────────────────────────────
+    void UpdateAngles()
+    {
+        heightAngle = SlopeAngleCheck(transform.eulerAngles.x);
+        lrAngle     = SlopeAngleCheck(transform.eulerAngles.z);
+    }
+
+    // ── TEST_MODE 키보드 입력 ─────────────────────────────────────
+    void ApplyKeyboard()
+    {
+        // pedalSpeed는 내부 단위 (km/h 환산 시 _pedalLevel * KMH_PER_STEP)
+        pedalSpeed = _pedalLevel * 13f;
+
+        if      (Input.GetKey(KeyCode.RightArrow) || Input.GetKey(KeyCode.D)) handle =  1f;
+        else if (Input.GetKey(KeyCode.LeftArrow)  || Input.GetKey(KeyCode.A)) handle = -1f;
+        else                                                                   handle =  0f;
+
+        steer = maxValue.MaxSteer * handle;
+        drift = Input.GetKey(KeyCode.Space) || CBikeSerial.GetDrift();
+
+        // 점프
+        if ((groundF || groundR) && Input.GetKeyDown(KeyCode.Q))
+            _rb.AddForce(transform.up * 250f, ForceMode.Acceleration);
+    }
+
+    // ── Raycast 접지 감지 ─────────────────────────────────────────
+    void RaycastGround()
+    {
+        float rayLen    = 4.0f;  // 위 2m + 아래 2m (급경사 오르막 감지)
+        float upOffset  = 2.0f;  // 레이 시작을 pivot 2m 위에서 → 경사면에 파묻히지 않음
+        float fwdOffset = 0.5f;
+
+        // 수평 forward 사용 — 바이크 pitch 각도와 무관하게 정확한 앞뒤 위치 감지
+        Vector3 hFwd = transform.forward;
+        hFwd.y = 0f;
+        if (hFwd.sqrMagnitude > 0.01f) hFwd.Normalize();
+        else hFwd = Vector3.forward;
+
+        Vector3 frontOrigin = transform.position + hFwd * fwdOffset + Vector3.up * upOffset;
+        Vector3 rearOrigin  = transform.position - hFwd * fwdOffset + Vector3.up * upOffset;
+
+        // upOffset=2m 이므로 레이가 위에서 아래로 내려오면서 바이크 자신의 Collider를 먼저 맞힐 수 있음
+        // RaycastAll + 자기 transform 제외 + 거리 순 정렬로 가장 가까운 지형 hit 선택
+        groundF = GroundRaycast(frontOrigin, rayLen, out _fHit);
+        groundR = GroundRaycast(rearOrigin,  rayLen, out _rHit);
+
+        // 지면 Y 평균 계산
+        if      (groundF && groundR) _groundY = (_fHit.point.y + _rHit.point.y) * 0.5f;
+        else if (groundF)            _groundY = _fHit.point.y;
+        else if (groundR)            _groundY = _rHit.point.y;
+
+        Debug.DrawRay(frontOrigin, Vector3.down * rayLen, groundF ? Color.green : Color.red);
+        Debug.DrawRay(rearOrigin,  Vector3.down * rayLen, groundR ? Color.green : Color.red);
+    }
+
+    // 자기 자신 제외 + 거리 순으로 가장 가까운 지면 hit 반환
+    bool GroundRaycast(Vector3 origin, float maxDist, out RaycastHit result)
+    {
+        RaycastHit[] hits = Physics.RaycastAll(origin, Vector3.down, maxDist,
+                                               ~0, QueryTriggerInteraction.Ignore);
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (var h in hits)
         {
-            // 비정상 상승 속도 클램프 (suspension 폭발 → lrAngle > 50 → Crash 루프 방지)
-            Vector3 vel = _rb.linearVelocity;
-            if (vel.y > 3f) { vel.y = 3f; _rb.linearVelocity = vel; }
+            if (h.transform.IsChildOf(transform)) continue;
+            result = h;
+            return true;
+        }
+        result = default;
+        return false;
+    }
 
-            // ── 수평 속도 폭발 클램프 ─────────────────────────────
+    // ── 이동 (Kinematic — transform 직접 제어) ────────────────────
+    void ApplyMovement()
+    {
+        bool grounded = groundF || groundR;
+
+        // 목표 수평 속도 (m/s)
+        float targetMS = GameData.TEST_MODE
+            ? _pedalLevel * (KMH_PER_STEP / 3.6f)
+            : pedalSpeed / 3.6f;
+
+        Vector3 pos = transform.position;
+
+        // ── 수직: 지면 스냅 or 중력 ──────────────────────────────
+        if (grounded)
+        {
+            _verticalVel = 0f;
+
+            // ── 경사(Pitch) 계산: 앞뒤 지형 높이 차로 바이크 기울기 결정 ──────
+            // 앞바퀴가 지면 아래에 파묻히는 이유: 바이크 몸체가 경사와 무관하게 수평이면
+            // 앞 0.5m 지점에서 지형이 올라와도 바이크 앞부분이 그대로 수평 유지 → 지형에 박힘
+            float slopeRad = 0f;
+            if (groundF && groundR)
             {
-                Vector3 hv = _rb.linearVelocity;
-                float hSpeedSq = hv.x * hv.x + hv.z * hv.z;
-                if (hSpeedSq > 100f) // 10 m/s 초과
-                {
-                    hv.x = 0f; hv.z = 0f;
-                    _rb.linearVelocity = hv;
-                }
+                float wheelbase  = 0.5f * 2f; // fwdOffset × 2 = 1.0m
+                float heightDiff = _fHit.point.y - _rHit.point.y; // + = 오르막
+                slopeRad = Mathf.Atan2(heightDiff, wheelbase);
+                float slopeDeg = Mathf.Clamp(slopeRad * Mathf.Rad2Deg, -60f, 60f);
+                // Unity X 음수 = 앞이 올라감 (오르막), 양수 = 앞이 내려감 (내리막)
+                Vector3 euler = transform.eulerAngles;
+                transform.eulerAngles = new Vector3(-slopeDeg, euler.y, euler.z);
             }
 
-            // ── 각속도 폭발 클램프 ────────────────────────────────
-            // 폴리곤 대삼각형 접촉 → 비정상 토크 → lrAngle 누적 → 크래시 루프 방지
-            if (_rb.angularVelocity.sqrMagnitude > 4f) // > 2 rad/s
-                _rb.angularVelocity = Vector3.zero;
-
-            // ── z축 기울기 교정 (lrAngle 누적 방지) ─────────────────
-            // 폴리곤 접촉으로 인한 비정상 기울기가 5° 이상 누적되면 즉시 교정
-            {
-                Vector3 eu = transform.eulerAngles;
-                float zAngle = eu.z > 180f ? eu.z - 360f : eu.z;
-                if (Mathf.Abs(zAngle) > 5f)
-                    transform.eulerAngles = new Vector3(eu.x, eu.y, 0f);
-            }
-
-            // WheelCollider motorTorque 우회:
-            //   pedalSpeed=0 으로 Move() 호출 → 조향·마찰·angularDamping 만 처리
-            float savedPedal = pedalSpeed;
-            pedalSpeed = 0f;
-            Move(true);
-            pedalSpeed = savedPedal;
-
-            // Move() 내부에서 pedalSpeed=0 이면 brakeTorque × 2 가 설정되므로 명시 재설정
-            if (wheelSetting.wheels != null)
-            {
-                float bt = (_pedalLevel != 0) ? 0f : 500f;
-                foreach (WheelCollider pos in wheelSetting.wheels)
-                { pos.motorTorque = 0f; pos.brakeTorque = bt; }
-            }
-
-            // ── 정지 상태 강제 (pedalLevel == 0) ──────────────
-            //   장애물·경사면이 바이크를 밀어도 수평 속도 0 유지 (테스트 목적)
-            if (_pedalLevel == 0 && !_rb.isKinematic)
-            {
-                Vector3 v = _rb.linearVelocity;
-                v.x = 0f; v.z = 0f;
-                _rb.linearVelocity = v;
-            }
-
-            // ── 전진/후진: 수평 속도 직접 설정 ──────────────────
-            //   위↑ 1번 = +1 km/h, 단계 × (1/3.6) m/s
-            //   AddForce 방식은 폴리곤 노이즈 속도와 보정력이 충돌하여
-            //   좌우 진동을 유발하므로, 속도를 직접 forward 방향으로 강제
-            //   lrAngle ≥ 45° 이면 미적용 (넘어진 상태 폭주 방지)
-            if (_pedalLevel != 0 && Mathf.Abs(lrAngle) < 45f)
-            {
-                float targetSpeed = _pedalLevel * (1.0f / 3.6f); // 단계 × 1 km/h → m/s
-                Vector3 fwd = transform.forward; fwd.y = 0f;
-                if (fwd.sqrMagnitude > 0.01f) fwd.Normalize();
-                Vector3 driveVel = _rb.linearVelocity;
-                driveVel.x = fwd.x * targetSpeed;
-                driveVel.z = fwd.z * targetSpeed;
-                _rb.linearVelocity = driveVel;
-                // realSpeed 교정: PhysX 노이즈가 realSpeed를 오염시켜 spd>45 크래시 오탐 발생
-                // 의도 속도(pedalLevel × 1 km/h)로 덮어써서 장애물 충돌 조건 오탐 차단
-                realSpeed = Mathf.Abs(_pedalLevel) * 1.0f;
-                _control.moveValue.realSpeed = realSpeed;
-            }
-            else if (_pedalLevel == 0 && !_rb.isKinematic)
-            {
-                realSpeed = 0f;
-                _control.moveValue.realSpeed = 0f;
-            }
+            // 직접 스냅 — 바퀴가 어디서든 지면에 닿도록 (경사 보정 포함)
+            pos.y = _groundY + _groundOffset * Mathf.Cos(slopeRad);
         }
         else
         {
-            Move(true);
-            if (pedalSpeed == 0f && wheelSetting.wheels != null)
-                foreach (WheelCollider pos in wheelSetting.wheels)
-                    pos.brakeTorque = 500f;
+            _verticalVel -= 9.8f * Time.fixedDeltaTime; // 중력
+            pos.y += _verticalVel * Time.fixedDeltaTime;
+
+            // 코스 이탈 안전망: Y가 -30 이하로 떨어지면 자동 리스폰
+            if (pos.y < -30f)
+            {
+                Debug.Log("[Cycle_Move] 코스 이탈 감지 (Y=" + pos.y.ToString("F1") + ") → 자동 리스폰");
+                _control.deadState = 2;
+                return;
+            }
         }
 
-        SyncData_Send_Self();
-        SyncData_Send();
-	}
+        // ── 겹침 탈출: 정지 중에도 주변 벽 겹침 감지 후 밀어냄 ───────
+        PushOutFromWalls(ref pos);
 
-    // Phase 1→2 전환 시 지형 정보를 콘솔에 출력 (원인 분석용)
-    private void LogTerrainAtPhase2()
-    {
-        Vector3 pos = transform.position;
-
-        // 지면 Raycast
-        RaycastHit hit;
-        string surfaceInfo = "지면 없음";
-        if (Physics.Raycast(pos + Vector3.up * 2f, Vector3.down, out hit, 30f))
+        // ── 수평: forward 방향 이동 ───────────────────────────────
+        if (Mathf.Abs(targetMS) > 0.01f)
         {
-            surfaceInfo = string.Format("이름={0} 태그={1} 법선={2} 거리={3:F2}m",
-                hit.collider.name, hit.collider.tag,
-                hit.normal.ToString("F2"), hit.distance);
+            Vector3 fwd = transform.forward;
+            fwd.y = 0f;
+            if (fwd.sqrMagnitude > 0.01f) fwd.Normalize();
+
+            float moveStep = targetMS * Time.fixedDeltaTime;
+            float moveSign = Mathf.Sign(moveStep);
+            Vector3 moveVec = fwd * moveStep;
+
+            // 전방 SphereCast — 수직 벽 감지 및 슬라이드
+            moveVec = ObstacleCheck(pos, fwd, moveStep, moveSign, moveVec);
+
+            pos += moveVec;
+
+            // 조향
+            float dir = targetMS >= 0f ? 1f : -1f;
+            transform.Rotate(Vector3.up, steer * 1.5f * dir * Time.fixedDeltaTime);
         }
 
-        // 주변 2m 콜라이더
-        Collider[] nearby = Physics.OverlapSphere(pos, 2f);
-        var sb = new System.Text.StringBuilder();
-        foreach (var c in nearby)
-        {
-            if (c.transform.IsChildOf(transform)) continue;
-            sb.Append(c.name).Append("[").Append(c.tag).Append("] ");
-        }
-        string nearbyInfo = sb.Length > 0 ? sb.ToString() : "없음";
-
-        Debug.Log(string.Format(
-            "[Cycle_Move] Phase2 진입 지형 분석\n" +
-            "  위치={0}\n" +
-            "  lrAngle={1:F1}° heightAngle={2:F1}°\n" +
-            "  groundF={3} groundR={4}\n" +
-            "  지면: {5}\n" +
-            "  주변 콜라이더: {6}",
-            pos.ToString("F1"),
-            lrAngle, heightAngle,
-            groundF, groundR,
-            surfaceInfo, nearbyInfo));
+        transform.position = pos;
     }
 
-    private void SnapToGround()
+    // ── 자세 안정화 ───────────────────────────────────────────────
+    // FreezeRotationX|Z 로 물리적 쓰러짐 차단.
+    // lrAngle 갱신만 담당 (Cycle_Impact Crash 조건용)
+    void StabilizeLean()
     {
-        float heightOffset = CalcGroundOffset();
-        Vector3 rayOrigin = transform.position + Vector3.up * 3f;
-        RaycastHit[] hits = Physics.RaycastAll(rayOrigin, Vector3.down, 50f);
-        float bestY = float.MinValue;
-        // 현재 위치보다 0.5m 이상 위의 히트는 폴리곤 벽 상단으로 간주하여 무시
-        // "가장 높은 히트" 선택 시 벽 상단에 스냅되어 하늘로 솟구치는 버그 방지
-        float maxGroundY = transform.position.y + 0.5f;
-        foreach (var hit in hits)
+        // UpdateAngles()와 동일한 계산으로 일관성 유지
+        lrAngle = SlopeAngleCheck(transform.eulerAngles.z);
+    }
+
+    // ── 속도 계산 ─────────────────────────────────────────────────
+    private float _debugTimer = 0f;
+    void UpdateSpeed()
+    {
+        // kinematic이므로 위치 변화량으로 속도 계산
+        Vector3 delta = transform.position - _prevPos;
+        delta.y = 0f;
+        realSpeed = delta.magnitude / Time.fixedDeltaTime * 3.6f; // m/s → km/h
+        _prevPos  = transform.position;
+
+        // 2초마다 상태 출력 (정상 동작 확인 후 제거)
+        _debugTimer += Time.fixedDeltaTime;
+        if (_debugTimer >= 2f)
         {
-            if (hit.transform.IsChildOf(transform)) continue;
-            if (hit.point.y > maxGroundY) continue;
-            if (hit.point.y > bestY) bestY = hit.point.y;
+            _debugTimer = 0f;
+            Debug.Log(string.Format(
+                "[Cycle_Move] spd={0:F1}km/h pedal={1} groundF={2} groundR={3} lr={4:F1}° pos={5}",
+                realSpeed, _pedalLevel, groundF, groundR, lrAngle,
+                transform.position.ToString("F1")));
         }
-        if (bestY > float.MinValue)
+
+        // 타이어 회전 애니메이션
+        if (tireSetting.front != null)
+            tireSetting.front.Rotate(Vector3.right * realSpeed * Time.fixedDeltaTime * 50f);
+        if (tireSetting.rear != null)
+            tireSetting.rear.Rotate(Vector3.right * realSpeed * Time.fixedDeltaTime * 50f);
+    }
+
+    // ── 장애물 벽 감지 (SphereCast) ──────────────────────────────
+    // 반환값: 장애물 처리 후 실제 이동벡터
+    static bool IsWallHit(RaycastHit h, Transform self)
+    {
+        if (h.transform.IsChildOf(self)) return false;
+        if (h.collider is TerrainCollider)   return false;
+        if (Mathf.Abs(h.normal.y) >= 0.5f)   return false; // 경사면 제외
+        return true;
+    }
+
+    Vector3 ObstacleCheck(Vector3 pos, Vector3 fwd, float moveStep, float moveSign, Vector3 moveVec)
+    {
+        const float SPHERE_R  = 0.4f;
+        const float OVERLAP_T = 0.5f; // 이 거리 이하 = 겹침으로 판단
+        float castDist = Mathf.Abs(moveStep) + SPHERE_R + 0.1f;
+
+        RaycastHit obsHit;
+        if (!Physics.SphereCast(pos + Vector3.up * 0.6f, SPHERE_R,
+                fwd * moveSign, out obsHit, castDist,
+                ~0, QueryTriggerInteraction.Ignore))
+            return moveVec;
+
+        if (!IsWallHit(obsHit, transform)) return moveVec;
+
+        Vector3 wallN = new Vector3(obsHit.normal.x, 0f, obsHit.normal.z);
+        if (wallN.sqrMagnitude < 0.01f) return moveVec;
+        wallN.Normalize();
+
+        if (obsHit.distance < OVERLAP_T)
         {
-            Vector3 pos = transform.position;
-            pos.y = bestY + heightOffset;
-            transform.position = pos;
+            // 이미 겹침 — 구 반경 + 여유만큼 밀어내어 완전 탈출
+            // Beech_04(반경 0.73m) 같은 큰 나무도 탈출 가능하도록 충분한 거리 확보
+            float pushDist = SPHERE_R - obsHit.distance + 0.15f;
+            // ApplyMovement()에서 pos에 직접 적용하므로 여기서는 moveVec만 조정
+            // 실제 pos 조작은 PushOutFromWalls에서 이미 처리됨
+            return Vector3.zero;
+        }
+        else
+        {
+            // 접근 중 — 안전거리까지 전진 + 벽 접선 슬라이드
+            float toWall = Mathf.Max(0f, obsHit.distance - SPHERE_R);
+            Vector3 slide = moveVec - Vector3.Dot(moveVec, wallN) * wallN;
+            return fwd * toWall * moveSign + slide;
         }
     }
 
-    private float CalcGroundOffset()
+    // ── 겹침 탈출 (정지 중에도 매 프레임 실행) ───────────────────
+    // OverlapSphere로 현재 위치 주변의 벽 콜라이더를 찾아 밀어냄
+    void PushOutFromWalls(ref Vector3 pos)
     {
-        if (wheelSetting.wheels == null || wheelSetting.wheels.Length == 0)
-            return 1.0f;
-        float maxOffset = float.MinValue;
-        foreach (var wc in wheelSetting.wheels)
+        const float SPHERE_R = 0.5f; // 탐지 반경 (나무 0.73m 감안하여 넉넉히)
+        Vector3 sphereCenter = pos + Vector3.up * 0.6f;
+
+        Collider[] cols = Physics.OverlapSphere(sphereCenter, SPHERE_R,
+                              ~0, QueryTriggerInteraction.Ignore);
+        foreach (var col in cols)
         {
-            if (wc == null) continue;
-            Vector3 wcInRootLocal = transform.InverseTransformPoint(
-                wc.transform.TransformPoint(wc.center));
-            float needed = wc.radius - wcInRootLocal.y + 0.1f;
-            if (needed > maxOffset) maxOffset = needed;
+            if (col.transform.IsChildOf(transform)) continue;
+            if (col is TerrainCollider) continue;
+
+            // 겹친 콜라이더의 가장 가까운 점 → 바이크 방향으로 밀어냄
+            Vector3 closest = col.ClosestPoint(sphereCenter);
+            Vector3 pushDir = sphereCenter - closest;
+            pushDir.y = 0f;
+            if (pushDir.sqrMagnitude < 0.0001f) continue;
+
+            // 지면 법선 필터 (경사면 제외)
+            float overlap = SPHERE_R - pushDir.magnitude;
+            if (overlap <= 0f) continue;
+
+            pushDir.Normalize();
+            pos += pushDir * (overlap + 0.05f);
         }
-        return maxOffset > float.MinValue ? maxOffset : 1.0f;
     }
 
-    private float jumpTime;
-    private bool bLanding;
-
+    // ── 점프 감지 ─────────────────────────────────────────────────
     void CheckJump()
     {
         if (!groundF && !groundR)
         {
-            jumpTime += Time.fixedDeltaTime;
-            bool hi = false;
+            _jumpTime += Time.fixedDeltaTime;
             RaycastHit hit;
-            bool b = Physics.Raycast(transform.position, new Vector3(0, -1, 0), out hit, 10);
-            if (b && hit.distance > 0.5f) hi = true;
+            bool b = Physics.Raycast(transform.position, Vector3.down, out hit, 10f);
             float t = 0.4f;
-            if (hit.distance < 1) t = t * hit.distance;
-            if (hi && jumpTime > t)
+            if (b && hit.distance < 1f) t *= hit.distance;
+            if (b && hit.distance > 0.5f && _jumpTime > t)
             {
-                if (!bLanding)
-                    CBikeSerial.m_nJump = 1;
-                bLanding = true;
+                if (!_bLanding) CBikeSerial.m_nJump = 1;
+                _bLanding = true;
             }
         }
         else
         {
-            jumpTime = 0;
-            if (groundF && groundR && bLanding)
+            _jumpTime = 0f;
+            if (groundF && groundR && _bLanding)
             {
-                bLanding = false;
+                _bLanding = false;
                 CBikeSerial.m_nJump = 3;
             }
         }
     }
 
-    private int breakold = 0;
-    private bool handleAct = false;
-    private float jTime = 0;
-
-    void Serial()
+    // ── 지면 스냅 (스폰/리스폰 시) ───────────────────────────────
+    void SnapToGround()
     {
-        int b1 = 0, b2 = 0;
-        if (_control.deadState > 0 && _control.User)
-            CBikeSerial.m_nJump = 0;
+        // 200m: 리스폰 위치가 지면보다 100m+ 높을 수 있음 (waypoint 고도 차이)
+        RaycastHit[] hits = Physics.RaycastAll(
+            transform.position + Vector3.up * 3f, Vector3.down, 200f);
 
-        CBikeSerial.FrameBike(Time.fixedDeltaTime, heightAngle, maxValue.MaxSteer, (int)(_control.environment), _rb.linearVelocity.magnitude);
-        b1 = CBikeSerial.b1;
-        b2 = CBikeSerial.b2;
+        float bestY = float.MinValue;
+        float maxY  = transform.position.y + 0.5f; // 폴리곤 벽 상단 무시
 
-        if (breakold != (b1 + b2) && (b1 + b2) > 4)
+        foreach (var hit in hits)
         {
-            breakold = (b1 + b2);
-            AudioCtr.Play(AudioCtr.snd_break[0], transform.position);
-        }
-        steer = CBikeSerial.m_fSteer;
-
-        if (steer == 0)
-            steer = Input.GetAxis("Horizontal") * 35;
-
-        if (steer == 0)
-        {
-            if (CBikeSerial.jBtn == "B")
-            {
-                if (CBikeSerial.GetNewSwitch1(1))
-                {
-                    if (steer > 0) jTime = 0;
-                    jTime += CBikeSerial.jSpeed * Time.deltaTime;
-                    steer = -35 * jTime;
-                    if (steer < -35) steer = -35;
-                }
-                else if (CBikeSerial.GetNewSwitch1(0))
-                {
-                    if (steer < 0) jTime = 0;
-                    jTime += CBikeSerial.jSpeed * Time.deltaTime;
-                    steer = 35 * jTime;
-                    if (steer > 35) steer = 35;
-                }
-                else
-                {
-                    jTime = 0;
-                    steer = Mathf.MoveTowards(steer, 0, Time.deltaTime);
-                }
-            }
-            else if (CBikeSerial.jBtn == "b")
-            {
-                if (CBikeSerial.GetNewSwitch2(1))
-                {
-                    if (steer > 0) jTime = 0;
-                    jTime += CBikeSerial.jSpeed * Time.deltaTime;
-                    steer = -35 * jTime;
-                    if (steer < -35) steer = -35;
-                }
-                else if (CBikeSerial.GetNewSwitch2(0))
-                {
-                    if (steer < 0) jTime = 0;
-                    jTime += CBikeSerial.jSpeed * Time.deltaTime;
-                    steer = 35 * jTime;
-                    if (steer > 35) steer = 35;
-                }
-                else
-                {
-                    jTime = 0;
-                    steer = Mathf.MoveTowards(steer, 0, Time.deltaTime);
-                }
-            }
+            if (hit.transform.IsChildOf(transform)) continue;
+            if (hit.point.y > maxY)  continue;
+            if (hit.point.y > bestY) bestY = hit.point.y;
         }
 
-        pedalSpeed = 130 * Input.GetAxis("Vertical");
-        if (pedalSpeed == 0)
-		{
-            if (GameData.autoMode == "1")
-            {
-                if (CBikeSerial.m_fPedalSpeed == 0)
-                    pedalSpeed = 12.5f * int.Parse(GameData.autoModeSpeed);
-                else
-                    pedalSpeed = CBikeSerial.m_fPedalSpeed;
-            }
-			else pedalSpeed = CBikeSerial.m_fPedalSpeed;
-        }
-
-        if ((b1 != 0 && b2 == 0) || (b1 == 0 && b2 != 0) || Input.GetKey(KeyCode.Space))
-            drift = true;
-        else
-            drift = false;
-
-        if (!drift)
-            resistance = CBikeSerial.m_fBrakeTorque;
-
-        float Khandle = Input.GetAxis("Horizontal");
-        if (Khandle == 0)
+        if (bestY > float.MinValue)
         {
-            if (handleAct)
-            {
-                if (drift) handle = -CBikeSerial.GetHandle2() * 0.075f;
-                else       handle = -CBikeSerial.GetHandle2() * 0.04f;
-            }
-            else
-            {
-                if (handle != CBikeSerial.GetHandle2()) handleAct = true;
-            }
-        }
-        else
-            handle = Khandle;
-
-        if (realSpeed < 2)
-        {
-            if (CBikeSerial.GetNewButton(2) || Input.GetKeyDown(KeyCode.Q))
-                _control.deadState = 2;
+            Vector3 pos = transform.position;
+            pos.y = bestY + _groundOffset;
+            transform.position = pos;
+            Debug.Log("[Cycle_Move] SnapToGround: bestY=" + bestY.ToString("F2") + " → posY=" + pos.y.ToString("F2"));
         }
     }
 
+    // ── Respawn 재시작 ────────────────────────────────────────────
+    void DoRespawn()
+    {
+        _startTimer  = 0f;
+        _ready       = false;
+        _pedalLevel  = 0;
+        pedalSpeed   = 0f;
+        handle       = 0f;
+        steer        = 0f;
+        _rb.isKinematic = true;
+        _rb.useGravity  = false;
+        _verticalVel    = 0f;
+        _prevPos        = transform.position; // 리스폰 위치로 초기화 → realSpeed 급등 방지
+        realSpeed       = 0f;
+        _control.cycle_Impact = false;
+        physicsPhasePublic    = 0;
+        Debug.Log("[Cycle_Move] Respawn → 재시작");
+    }
+
+    // ── SyncData ──────────────────────────────────────────────────
     void SyncData_Send()
     {
         _control.moveValue.realSpeed   = realSpeed;
@@ -670,57 +525,112 @@ public class Cycle_Move : MoveModule {
         resistance = _control.moveValue.resistance;
     }
 
-    // WheelCollider + Polygon 충돌 복구 코루틴
-    private IEnumerator ReenableWheelColliders(float delay)
+    // ── 하드웨어 Serial 입력 ──────────────────────────────────────
+    void Serial()
     {
-        yield return new WaitForSeconds(delay);
-        if (!_rb.isKinematic)
-        {
-            _rb.linearVelocity  = Vector3.zero;
-            _rb.angularVelocity = Vector3.zero;
-        }
-        if (wheelSetting.wheels != null)
-            foreach (WheelCollider wc in wheelSetting.wheels)
-                if (wc != null) wc.enabled = true;
-        IgnoreNearbyMeshColliders(false);
-        Debug.Log("[Cycle_Move] WheelCollider + MeshCollider 충돌 복구 완료 (" + delay + "초 후)");
-    }
+        int b1 = 0, b2 = 0;
+        if (_control.deadState > 0 && _control.User)
+            CBikeSerial.m_nJump = 0;
 
-    // 반경 5m 내 모든 MeshCollider(Polygon·지형·도로 불문)와 바디 콜라이더 간 충돌 설정
-    // Tracking02_Terrain01, road333 등 Polygon 컴포넌트 없는 지형도 포함
-    private void IgnoreNearbyMeshColliders(bool ignore)
-    {
-        Collider[] bikeColliders = GetComponentsInChildren<Collider>(true);
-        if (ignore)
+        CBikeSerial.FrameBike(Time.fixedDeltaTime, heightAngle,
+                              maxValue.MaxSteer, (int)(_control.environment),
+                              _rb.linearVelocity.magnitude);
+        b1 = CBikeSerial.b1;
+        b2 = CBikeSerial.b2;
+
+        if (_breakold != (b1 + b2) && (b1 + b2) > 4)
         {
-            _ignoredMeshColliders.Clear();
-            Collider[] nearby = Physics.OverlapSphere(transform.position, 5f);
-            foreach (Collider nc in nearby)
-            {
-                if (!(nc is MeshCollider)) continue;
-                if (nc.transform.IsChildOf(transform)) continue;
-                _ignoredMeshColliders.Add(nc);
-                foreach (Collider bc in bikeColliders)
-                {
-                    if (bc is WheelCollider) continue;
-                    Physics.IgnoreCollision(bc, nc, true);
-                }
-            }
-            Debug.Log("[Cycle_Move] 인근 MeshCollider 충돌 무시: " + _ignoredMeshColliders.Count + "개");
+            _breakold = (b1 + b2);
+            AudioCtr.Play(AudioCtr.snd_break[0], transform.position);
         }
-        else
+
+        steer = CBikeSerial.m_fSteer;
+        if (steer == 0) steer = Input.GetAxis("Horizontal") * 35f;
+
+        if (steer == 0)
         {
-            foreach (Collider nc in _ignoredMeshColliders)
+            if (CBikeSerial.jBtn == "B")
             {
-                if (nc == null) continue;
-                foreach (Collider bc in bikeColliders)
+                if (CBikeSerial.GetNewSwitch1(1))
                 {
-                    if (bc is WheelCollider) continue;
-                    Physics.IgnoreCollision(bc, nc, false);
+                    if (steer > 0) _jTime = 0f;
+                    _jTime += CBikeSerial.jSpeed * Time.deltaTime;
+                    steer   = -35f * _jTime;
+                    if (steer < -35f) steer = -35f;
+                }
+                else if (CBikeSerial.GetNewSwitch1(0))
+                {
+                    if (steer < 0) _jTime = 0f;
+                    _jTime += CBikeSerial.jSpeed * Time.deltaTime;
+                    steer   = 35f * _jTime;
+                    if (steer > 35f) steer = 35f;
+                }
+                else
+                {
+                    _jTime = 0f;
+                    steer  = Mathf.MoveTowards(steer, 0f, Time.deltaTime);
                 }
             }
-            Debug.Log("[Cycle_Move] 인근 MeshCollider 충돌 복구: " + _ignoredMeshColliders.Count + "개");
-            _ignoredMeshColliders.Clear();
+            else if (CBikeSerial.jBtn == "b")
+            {
+                if (CBikeSerial.GetNewSwitch2(1))
+                {
+                    if (steer > 0) _jTime = 0f;
+                    _jTime += CBikeSerial.jSpeed * Time.deltaTime;
+                    steer   = -35f * _jTime;
+                    if (steer < -35f) steer = -35f;
+                }
+                else if (CBikeSerial.GetNewSwitch2(0))
+                {
+                    if (steer < 0) _jTime = 0f;
+                    _jTime += CBikeSerial.jSpeed * Time.deltaTime;
+                    steer   = 35f * _jTime;
+                    if (steer > 35f) steer = 35f;
+                }
+                else
+                {
+                    _jTime = 0f;
+                    steer  = Mathf.MoveTowards(steer, 0f, Time.deltaTime);
+                }
+            }
+        }
+
+        pedalSpeed = 130f * Input.GetAxis("Vertical");
+        if (pedalSpeed == 0f)
+        {
+            if (GameData.autoMode == "1")
+            {
+                if (CBikeSerial.m_fPedalSpeed == 0f)
+                    pedalSpeed = 12.5f * int.Parse(GameData.autoModeSpeed);
+                else
+                    pedalSpeed = CBikeSerial.m_fPedalSpeed;
+            }
+            else pedalSpeed = CBikeSerial.m_fPedalSpeed;
+        }
+
+        drift = (b1 != 0 && b2 == 0) || (b1 == 0 && b2 != 0) || Input.GetKey(KeyCode.Space);
+        if (!drift) resistance = CBikeSerial.m_fBrakeTorque;
+
+        float kHandle = Input.GetAxis("Horizontal");
+        if (kHandle == 0)
+        {
+            if (_handleAct)
+            {
+                handle = drift
+                    ? -CBikeSerial.GetHandle2() * 0.075f
+                    :  -CBikeSerial.GetHandle2() * 0.04f;
+            }
+            else
+            {
+                if (handle != CBikeSerial.GetHandle2()) _handleAct = true;
+            }
+        }
+        else handle = kHandle;
+
+        if (realSpeed < 2f)
+        {
+            if (CBikeSerial.GetNewButton(2) || Input.GetKeyDown(KeyCode.Q))
+                _control.deadState = 2;
         }
     }
 }

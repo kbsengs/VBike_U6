@@ -38,13 +38,16 @@ public class Cycle_Impact : MonoBehaviour {
     // 스폰/리스폰 직후 폴리곤 지형 WheelCollider 불안정으로 인한 오탐 방지
     // cycle_Impact 활성화 후 CRASH_GRACE_SEC 초 동안 충돌 감지 차단
     private float _crashGraceTimer = 0f;
-    private const float CRASH_GRACE_SEC = 5.0f;
+    private const float CRASH_GRACE_SEC = 15.0f; // 리스폰 후 waypoint 고도차로 낙하 시간 확보
 
     void Update()
     {
         switch (_control.deadState)
         {
             case 0:
+                // Respawn 완료(2→0 전환) 시 유예 타이머 리셋
+                if (deadState != 0)
+                    _crashGraceTimer = 0f;
                 deadState = _control.deadState;
                 if (_control.User)
                 {
@@ -242,6 +245,9 @@ public class Cycle_Impact : MonoBehaviour {
                 {
                     if (spd > 45)
                     {
+                        // 지형 메시(TerrainCollider 또는 법선이 위를 향하는 경사면)는 크래시 제외
+                        if (t.collider is TerrainCollider) continue;
+                        if (t.normal != Vector3.zero && t.normal.y > 0.5f) continue;
                         Debug.Log(string.Format("[Impact] 앞충돌-장애물 크래시: hit={0}[{1}] spd={2:F1}", t.transform.name, t.transform.tag, spd));
                         _control.deadState = 1;
                     }
@@ -299,6 +305,9 @@ public class Cycle_Impact : MonoBehaviour {
             {
                 if (!t.transform.IsChildOf(MyTransform))
                 {
+                    // TerrainCollider는 지형이므로 Up Crash 대상 제외
+                    // (터널·구조물 MeshCollider만 감지)
+                    if (t.collider is TerrainCollider) continue;
                     Debug.DrawLine(raystart_U, t.point, Color.red);
                     Debug.Log(string.Format("[Impact] Up Crash: hit={0}[{1}] spd={2:F1}", t.transform.name, t.transform.tag, spd));
                     _control.deadState = 1;

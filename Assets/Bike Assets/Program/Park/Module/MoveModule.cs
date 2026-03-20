@@ -428,7 +428,7 @@ public class MoveModule : MonoBehaviour
     }
 
     //���� üũ
-    float SlopeAngleCheck(float slopeAngle)
+    protected float SlopeAngleCheck(float slopeAngle)
     {
         float angle = 0;
         if (slopeAngle > 90)
