@@ -18,7 +18,9 @@ VBike는 Unity 3.5 아케이드 자전거 시뮬레이터를 **Unity 6 (6000.3.1
 - ✅ `MoveModule.cs` / `Cycle_Move.cs`: `rigidbody` → `GetComponent<Rigidbody>()` (캐시)
 - ✅ `UDPConnection.cs`: `Network.*` 및 `[RPC]` 전부 제거, 커스텀 UDP만 유지
 - ✅ `NetworkRigidbody.cs`: 빈 스텁 (Phase 4 재구현 대기)
-- ✅ TEST_MODE 키보드 입력 및 물리 3단계 안정화 구현
+- ✅ TEST_MODE 키보드 입력 및 물리 안정화 구현
+- ✅ `Cycle_Move.cs`: WheelCollider 제거, Kinematic Raycast 이동 시스템 구현
+- ✅ 지면 밀착 수정: `_groundOffset` 자동 계산, Pitch 보정, RaycastAll 자기 필터링
 
 **Phase 4 (멀티플레이) — 미착수:**
 - ⏳ `Network/BMXMode/`, `Network/MTBMode/` 스크립트: `[RPC]` 대체 메시지 시스템 재구현
@@ -80,28 +82,44 @@ StateControl (GameObject, 씬 전환 시 유지)
 
 ```
 Cycle_Control (루트 — 상태 플래그 및 웨이포인트 추적)
-  ├─ Cycle_Move    (플레이어 물리: 시리얼/키보드 입력, WheelCollider 구동)
+  ├─ Cycle_Move    (플레이어 물리: 시리얼/키보드 입력, Raycast 기반 이동)
   ├─ Cycle_AI      (AI 물리: 웨이포인트 추종)
   ├─ Cycle_Impact  (충돌 감지, 래그돌 트리거)
   ├─ Cycle_Animation
   └─ Cycle_Smoke
 ```
 
-`Cycle_Move`와 `Cycle_AI` 모두 `MoveModule`을 상속한다 (`Assets/Bike Assets/Program/Park/Module/MoveModule.cs`). `MoveModule`이 `WheelCollider` 마찰/서스펜션 설정과 핵심 물리 루프를 담당한다.
+`Cycle_Move`와 `Cycle_AI` 모두 `MoveModule`을 상속한다 (`Assets/Bike Assets/Program/Park/Module/MoveModule.cs`). `MoveModule`이 WheelCollider 초기화와 마찰/서스펜션 설정을 담당하지만, `Cycle_Move`에서는 **WheelCollider를 완전히 비활성화**하고 Raycast 기반으로 이동을 대체한다 (Unity 6 PhysX 5.x WheelCollider + MeshCollider 충돌 폭발력 문제).
 
 `Cycle_Control.moveValue` (`MoveValue` 타입)가 컴포넌트 간 공유 데이터 버스다 — 매 프레임 이동값을 쓰고 다른 컴포넌트가 읽는다.
 
-### Cycle_Move Physics Phases
+### Cycle_Move Kinematic Raycast 이동 시스템
 
-`Cycle_Move`는 스폰 후 물리 안정화를 위해 3단계 `physicsPhase`를 거친다:
+`Cycle_Move`는 완전 Kinematic Rigidbody (`isKinematic=true`, `useGravity=false`)로 동작한다. `transform.position`을 코드로 직접 제어한다.
 
-| Phase | 설명 | 조건 |
-|---|---|---|
-| 0 | 스폰 직후 대기 (kinematic, 입력 차단) | 3초 경과 |
-| 1 | 물리 안정화 대기 (접지 대기) | 최대 2초, `groundR \|\| groundF` |
-| 2 | 정상 주행 (플레이어 입력 유효) | — |
+**스폰 후 대기:** `START_DELAY(1초)` 동안 kinematic 유지 + `SnapToGround()` 실행 → 이후 정상 주행 (`_ready=true`).
 
-`_pedalLevel` (범위 `-10` ~ `+10`)이 속도 단계를 결정한다. 실제 속도 = `_pedalLevel × 13f` (최대 ≈ 130 = 100 km/h).
+**FixedUpdate 주행 루프 순서:**
+```
+UpdateAngles() → ApplyKeyboard()/Serial() → CheckJump()
+→ RaycastGround() → ApplyMovement() → StabilizeLean() → UpdateSpeed()
+```
+
+**RaycastGround():** `RaycastAll` + 자기 transform 필터링으로 앞뒤 지형 감지.
+- `upOffset=2.0m`, `rayLen=4.0m` — 급경사 오르막에서도 레이가 지형 위에서 시작
+- 자기 Collider 제외 필수: `upOffset` 증가로 레이가 바이크 프레임/안장을 먼저 맞힐 수 있음
+
+**ApplyMovement():** 지면 위치 = `_groundY + _groundOffset * cos(slopeRad)`.
+- `_groundOffset` — `Start()`에서 WheelCollider 반경·위치 기반 자동 계산 (`radius - pivotToWheelCenterY`)
+- Pitch 보정: 앞뒤 hit 높이 차 → `Atan2` → `euler.x = -slopeDeg` (오르막에서 앞이 올라감)
+- 수직: 접지 시 직접 스냅, 공중 시 수동 중력 (`_verticalVel -= 9.8f * dt`)
+- Y < -30f 이면 자동 리스폰 (`deadState=2`)
+
+**장애물 처리:**
+- `ObstacleCheck()`: 전방 SphereCast (반경 0.4m), `normal.y < 0.5` = 벽으로 판정, 슬라이드 이동
+- `PushOutFromWalls()`: OverlapSphere (반경 0.5m) + ClosestPoint 기반 겹침 탈출, `pushDir.y=0` (수직 밀어냄 제외)
+
+**`_pedalLevel`** (범위 `-20` ~ `+20`)이 속도 단계를 결정한다. 실제 속도 = `_pedalLevel × 13f` (최대 ≈ 130 내부 단위 = 100 km/h).
 
 ### TEST_MODE Keyboard Controls
 
@@ -134,9 +152,19 @@ Cycle_Control (루트 — 상태 플래그 및 웨이포인트 추적)
 
 트랙 3D 메시: `Assets/Bike Assets/3D/Map01/`, `Map02_01/`, `Map02_02/`, `Map04/`
 
-### WheelCollider Friction
+### Cycle_Impact 충돌/크래시 시스템
 
-`MoveValue`가 앞/뒤 `WheelCollider`에 적용할 마찰 곡선 파라미터를 저장한다. Unity 6에서 `WheelFrictionCurve` API(`extremumSlip`, `extremumValue`, `asymptoteSlip`, `asymptoteValue`, `stiffness`) 구조는 동일하지만, 값 타입(struct)이므로 반드시 복사 → 수정 → 재대입해야 한다.
+`deadState`: 0=정상, 1=크래시, 2=리스폰 중. `Cycle_Move`는 `deadState != 0`이면 이동을 완전 중단한다.
+
+**크래시 유예:** 스폰/리스폰 후 `CRASH_GRACE_SEC=15초` 동안 충돌 감지 차단 (`_crashGraceTimer`).
+
+**CapsuleCast 크래시 감지 주의사항:**
+- `TerrainCollider`는 항상 크래시 제외 (`is TerrainCollider` 체크)
+- 법선 `normal.y > 0.5f` 인 경사면 MeshCollider도 크래시 제외 (지형 오탐 방지)
+
+### WheelCollider Friction (Cycle_AI 전용)
+
+`Cycle_AI`는 `MoveModule.Move()`를 통해 WheelCollider 기반 물리를 사용한다. `WheelFrictionCurve` API는 값 타입(struct)이므로 반드시 복사 → 수정 → 재대입해야 한다. `Cycle_Move`에서는 WheelCollider가 비활성화되므로 해당 없음.
 
 ### Waypoint System
 
@@ -158,7 +186,7 @@ Cycle_Control (루트 — 상태 플래그 및 웨이포인트 추적)
 | `UDPConnection.cs` | **완료** | `Network.*` 제거, 커스텀 UDP만 유지 |
 | `NetworkRigidbody.cs` | **스텁** | Phase 4 재작성 대기 |
 | `MoveModule.cs` | **완료** | `_rb = GetComponent<Rigidbody>()` 캐시 적용 |
-| `Cycle_Move.cs` | **완료** | physicsPhase 3단계, 키보드 입력 구현 |
+| `Cycle_Move.cs` | **완료** | Kinematic Raycast 이동, WheelCollider 비활성, Pitch 보정, 지면 스냅 |
 | `Network/BMXMode/` 스크립트 | High | `[RPC]` 다수 사용 — Phase 4 |
 | `Network/MTBMode/` 스크립트 | High | `[RPC]` 다수 사용 — Phase 4 |
 | `GameData.cs` | **없음** | 순수 데이터 클래스, 레거시 API 없음 |
